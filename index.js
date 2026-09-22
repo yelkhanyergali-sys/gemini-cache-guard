@@ -1,0 +1,271 @@
+"use strict";
+
+/**
+ * gemini-cache-guard — фоновый keep-alive для Gemini через OpenAI-completions
+ * совместимый ротатор (agy → tuxevil).
+ *
+ * Логика:
+ *  1) Слушаем before_provider_request и запоминаем последний real payload
+ *     Gemini-запроса (модель + messages + tools).
+ *  2) Если в течение intervalMs (180с) не было реальной активности
+ *     (пользователь молчит/отошёл), шлём фоновый fetch на ТОТ ЖЕ endpoint
+ *     с тем же префиксом, но stream=false, max_tokens=1, temperature=0.
+ *     Google Antigravity отвечает 100% cache hit'ом и продлевает TTL
+ *     неявного кэша TPU — невидимо для сессии и без лишнего расхода.
+ *  3) Сторожим ТОЛЬКО Gemini-модели с api=openai-completions.
+ *  4) Любая реальная активность (input/turn/запрос) сбрасывает таймер;
+ *     уход в idle больше idleCapMs (30 мин) гасит сторож.
+ *  5) Смена модели/сессии или закрытие pi останавливает всё.
+ *
+ * В сессию ничего не пишем: никаких сообщений, никаких вызовов
+ * pi.sendUserMessage. Единственный след — строка в /tmp/gemini-cache-guard.log
+ * (или GEMINI_CACHE_GUARD_LOG).
+ */
+
+const { buildKeepAlivePayload, estimateInputTokens, isEligibleModel } = require("./lib/core.js");
+const fs = require("node:fs");
+
+module.exports = function (pi) {
+  const env = process.env;
+
+  const cfg = {
+    enabled: envBool(env, "GEMINI_CACHE_GUARD_ENABLED", true),
+    intervalMs: envInt(env, "GEMINI_CACHE_GUARD_INTERVAL_MS", 180_000),
+    idleCapMs: envInt(env, "GEMINI_CACHE_GUARD_IDLE_CAP_MS", 1_800_000),
+    minDelayMs: envInt(env, "GEMINI_CACHE_GUARD_MIN_DELAY_MS", 1_000),
+    requestTimeoutMs: envInt(env, "GEMINI_CACHE_GUARD_TIMEOUT_MS", 8_000),
+    minContextTokens: envInt(env, "GEMINI_CACHE_GUARD_MIN_CONTEXT_TOKENS", 8_192),
+    endpoint: env.GEMINI_CACHE_GUARD_ENDPOINT || "",
+    apiKey: env.GEMINI_CACHE_GUARD_API_KEY || "",
+    logFile: env.GEMINI_CACHE_GUARD_LOG || "/tmp/gemini-cache-guard.log",
+  };
+
+  if (!cfg.enabled) return;
+
+  // ---- состояние (приватное для экземпляра плагина) ----
+  let model = null; // последняя активная Gemini-модель
+  let modelRegistry = null; // из ExtensionContext — для резолва endpoint/apiKey
+  let lastPayload = null; // последний real payload Gemini-запроса
+  let lastActivity = 0; // ts последней реальной активности
+  let timer = null; // Node setTimeout handle
+  let inflight = null; // AbortController активного пинга
+  let guardOn = false;
+
+  // ---- утилиты ----
+  function log(msg) {
+    let line = "";
+    try {
+      line = `${new Date().toISOString()} ${msg}\n`;
+      if (typeof fs.appendFileSync === "function") {
+        fs.appendFileSync(cfg.logFile, line, "utf8");
+      } else {
+        const fd = fs.openSync(cfg.logFile, "a");
+        try { fs.writeSync(fd, Buffer.from(line, "utf8")); } finally { fs.closeSync(fd); }
+      }
+    } catch {
+      /* лог не критичен */
+    }
+  }
+
+  function stopTimer() {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  }
+
+  function cancelInflight() {
+    if (inflight) {
+      try { inflight.abort(); } catch { /* noop */ }
+      inflight = null;
+    }
+  }
+
+  function disableGuard(reason) {
+    if (!guardOn && !lastPayload && !timer) return;
+    guardOn = false;
+    lastPayload = null;
+    model = null;
+    stopTimer();
+    cancelInflight();
+    log(`guard off: ${reason}`);
+  }
+
+  function schedule() {
+    stopTimer();
+    if (!guardOn || !lastPayload || !model) return;
+    const now = Date.now();
+    const sinceLast = now - lastActivity;
+    if (sinceLast >= cfg.idleCapMs) {
+      disableGuard(`idle cap reached (${Math.round(sinceLast / 1000)}s without activity)`);
+      return;
+    }
+    const delay = Math.max(cfg.minDelayMs, lastActivity + cfg.intervalMs - now);
+    timer = setTimeout(runPing, delay);
+  }
+
+  function markActivity() {
+    lastActivity = Date.now();
+    schedule();
+  }
+
+  async function runPing() {
+    timer = null;
+    if (!guardOn || !lastPayload || !model || inflight) {
+      schedule();
+      return;
+    }
+
+    const keepAlive = buildKeepAlivePayload(lastPayload);
+    if (!keepAlive) {
+      disableGuard("payload no longer usable");
+      return;
+    }
+    const est = estimateInputTokens(keepAlive);
+    if (est < cfg.minContextTokens) {
+      log(`ping skip: est=${est} tokens < min(${cfg.minContextTokens})`);
+      schedule();
+      return;
+    }
+
+    // Endpoint/apiKey резолвим из реестра провайдеров (model.baseUrl в рантайме
+    // пуст для кастомных провайдеров — там он живёт в auth провайдера).
+    let endpoint = cfg.endpoint;
+    let apiKey = cfg.apiKey;
+    if (!endpoint && modelRegistry && model) {
+      try {
+        const auth = await modelRegistry.getApiKeyAndHeaders(model);
+        if (auth && auth.ok && auth.baseUrl) {
+          endpoint = String(auth.baseUrl).replace(/\/+$/, "");
+          apiKey = auth.apiKey || apiKey;
+        }
+      } catch (err) {
+        log(`auth resolve error: ${err}`);
+      }
+    }
+    if (!endpoint) {
+      disableGuard("no endpoint (modelRegistry has no baseUrl)");
+      return;
+    }
+    const url = /\/chat\/completions$/.test(endpoint) ? endpoint : `${endpoint}/chat/completions`;
+
+    const headers = { "Content-Type": "application/json" };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+    const controller = new AbortController();
+    inflight = controller;
+    const started = Date.now();
+    const timeout = setTimeout(() => controller.abort(), cfg.requestTimeoutMs);
+
+    try {
+      let res;
+      try {
+        res = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(keepAlive),
+          signal: controller.signal,
+        });
+      } catch (err) {
+        const aborted = inflight === null || (err && (/abort/i.test(String(err?.message || err))));
+        if (aborted) log("ping cancelled (superseded by activity)");
+        else log(`ping fetch error: ${err}`);
+        return;
+      }
+
+      const status = res && typeof res.status === "number" ? res.status : 0;
+      let bodyText = "";
+      let cached = null;
+      if (res && typeof res.text === "function") {
+        try { bodyText = await res.text(); } catch { bodyText = ""; }
+        try {
+          const parsed = JSON.parse(bodyText);
+          const usage = (parsed && parsed.usage) || {};
+          const details = usage.prompt_tokens_details || {};
+          cached = details.cached_tokens != null ? details.cached_tokens : null;
+        } catch { /* не JSON — не страшно */ }
+      }
+      const statusPart = status >= 400 ? ` body=${bodyText.slice(0, 240)}` : "";
+      log(`ping ${status} est=${est}${cached != null ? ` cached=${cached}` : ""} ms=${Date.now() - started}${statusPart}`);
+    } catch (err) {
+      log(`ping error: ${err}`);
+    } finally {
+      clearTimeout(timeout);
+      if (inflight === controller) inflight = null;
+      schedule();
+    }
+  }
+
+  // ---- события pi ----
+  pi.on("before_provider_request", (event, ctx) => {
+    try {
+      const m = ctx && ctx.model;
+      if (isEligibleModel(m)) {
+        const nowedOff = !guardOn;
+        model = m;
+        modelRegistry = (ctx && ctx.modelRegistry) || modelRegistry;
+        guardOn = true;
+        lastPayload = event && event.payload;
+        if (nowedOff) {
+          log(`armed est=${estimateInputTokens(lastPayload)} model=${m.id}`);
+        }
+        markActivity();
+      } else if (m || event) {
+        disableGuard("non-gemini provider request");
+      }
+    } catch (err) {
+      log(`before_provider_request error: ${err}`);
+    }
+  });
+
+  pi.on("model_select", (event, ctx) => {
+    try {
+      const m = (event && event.model) || (ctx && ctx.model);
+      if (isEligibleModel(m)) {
+        model = m;
+        guardOn = true;
+        if (lastPayload) markActivity();
+        else log("guard armed (waiting for first request)");
+      } else {
+        disableGuard("model_select: non-gemini");
+      }
+    } catch (err) {
+      log(`model_select error: ${err}`);
+    }
+  });
+
+  pi.on("session_start", () => {
+    disableGuard("session started/re-switched");
+    log("session_start");
+  });
+
+  pi.on("session_shutdown", () => {
+    disableGuard("session shutdown");
+    log("session_shutdown");
+  });
+
+  // Любой ввод/ход — реальная активность: отменяем висящий пинг и сдвигаем таймер.
+  pi.on("input", () => {
+    cancelInflight();
+    markActivity();
+  });
+  pi.on("turn_start", () => cancelInflight());
+  pi.on("turn_end", () => markActivity());
+  pi.on("agent_settled", () => markActivity());
+
+  log(`gemini-cache-guard loaded: interval=${cfg.intervalMs}ms cap=${cfg.idleCapMs}ms min=${cfg.minContextTokens} endpoint=${cfg.endpoint || "(from model)"}`);
+};
+
+// ---- helpers ----
+function envBool(env, name, def) {
+  const v = env[name];
+  if (v === undefined || v === "") return def;
+  return !/^(0|false|no|off)$/i.test(v.trim());
+}
+
+function envInt(env, name, def) {
+  const v = env[name];
+  if (v === undefined || v === "") return def;
+  const n = Number.parseInt(v.trim(), 10);
+  return Number.isNaN(n) || n <= 0 ? def : n;
+}

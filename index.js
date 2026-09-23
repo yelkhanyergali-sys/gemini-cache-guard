@@ -33,7 +33,7 @@ module.exports = function (pi) {
     intervalMs: envInt(env, "GEMINI_CACHE_GUARD_INTERVAL_MS", 180_000),
     idleCapMs: envInt(env, "GEMINI_CACHE_GUARD_IDLE_CAP_MS", 1_800_000),
     minDelayMs: envInt(env, "GEMINI_CACHE_GUARD_MIN_DELAY_MS", 1_000),
-    requestTimeoutMs: envInt(env, "GEMINI_CACHE_GUARD_TIMEOUT_MS", 8_000),
+    requestTimeoutMs: envInt(env, "GEMINI_CACHE_GUARD_TIMEOUT_MS", 45_000),
     minContextTokens: envInt(env, "GEMINI_CACHE_GUARD_MIN_CONTEXT_TOKENS", 8_192),
     endpoint: env.GEMINI_CACHE_GUARD_ENDPOINT || "",
     apiKey: env.GEMINI_CACHE_GUARD_API_KEY || "",
@@ -128,23 +128,63 @@ module.exports = function (pi) {
       return;
     }
 
-    // Endpoint/apiKey резолвим из реестра провайдеров (model.baseUrl в рантайме
-    // пуст для кастомных провайдеров — там он живёт в auth провайдера).
+    // Endpoint/apiKey резолвим из цепочки надёжных источников:
+    // 1) Явный конфиг/ENV (cfg.endpoint)
+    // 2) model.baseUrl (в Pi Mono у моделей провайдеров baseUrl задан прямо в объекте модели)
+    // 3) auth.baseUrl из modelRegistry.getApiKeyAndHeaders(model)
+    // 4) modelRegistry.getProvider(model.provider).baseUrl
+    // 5) Fallback на локальный ротатор agy (http://127.0.0.1:51200/v1)
     let endpoint = cfg.endpoint;
     let apiKey = cfg.apiKey;
-    if (!endpoint && modelRegistry && model) {
+
+    if (modelRegistry && model) {
       try {
         const auth = await modelRegistry.getApiKeyAndHeaders(model);
-        if (auth && auth.ok && auth.baseUrl) {
-          endpoint = String(auth.baseUrl).replace(/\/+$/, "");
-          apiKey = auth.apiKey || apiKey;
+        if (auth && auth.ok) {
+          if (!endpoint && auth.baseUrl) {
+            endpoint = String(auth.baseUrl).replace(/\/+$/, "");
+          }
+          if (!apiKey && auth.apiKey) {
+            apiKey = auth.apiKey;
+          }
         }
       } catch (err) {
         log(`auth resolve error: ${err}`);
       }
+
+      if ((!endpoint || !apiKey) && model.provider && typeof modelRegistry.getProvider === "function") {
+        try {
+          const prov = modelRegistry.getProvider(model.provider);
+          if (!endpoint && prov && prov.baseUrl) {
+            endpoint = String(prov.baseUrl).replace(/\/+$/, "");
+          }
+          if (!apiKey && prov && prov.apiKey) {
+            apiKey = prov.apiKey;
+          }
+        } catch { /* noop */ }
+      }
+
+      if (!apiKey && model.provider && typeof modelRegistry.getApiKeyForProvider === "function") {
+        try {
+          const key = await modelRegistry.getApiKeyForProvider(model.provider);
+          if (key) apiKey = key;
+        } catch { /* noop */ }
+      }
     }
+
+    if (!endpoint && model && model.baseUrl) {
+      endpoint = String(model.baseUrl).replace(/\/+$/, "");
+    }
+
+    if (!endpoint && model && (model.provider === "agy" || /gemini/i.test(model.id))) {
+      endpoint = "http://127.0.0.1:51200/v1";
+    }
+    if (!apiKey && model && (model.provider === "agy" || /gemini/i.test(model.id))) {
+      apiKey = "antigravity";
+    }
+
     if (!endpoint) {
-      disableGuard("no endpoint (modelRegistry has no baseUrl)");
+      disableGuard("no endpoint (cannot resolve baseUrl from model or registry)");
       return;
     }
     const url = /\/chat\/completions$/.test(endpoint) ? endpoint : `${endpoint}/chat/completions`;
@@ -210,8 +250,11 @@ module.exports = function (pi) {
           log(`armed est=${estimateInputTokens(lastPayload)} model=${m.id}`);
         }
         markActivity();
-      } else if (m || event) {
-        disableGuard("non-gemini provider request");
+      } else if (m && !isEligibleModel(m)) {
+        const activeModel = (ctx && typeof ctx.getModel === "function" ? ctx.getModel() : ctx && ctx.model) || m;
+        if (!isEligibleModel(activeModel)) {
+          disableGuard(`non-gemini provider request: ${m.id || "unknown"}`);
+        }
       }
     } catch (err) {
       log(`before_provider_request error: ${err}`);

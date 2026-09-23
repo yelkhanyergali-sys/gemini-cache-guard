@@ -66,6 +66,7 @@ function testCore() {
   assert.equal(ka.max_tokens, 1);
   assert.equal(ka.temperature, 0);
   assert.equal(ka.tool_choice, "none");
+  assert.equal(ka.reasoning_effort, "low");
   assert.equal(ka.max_completion_tokens, undefined);
   assert.equal(ka.stream_options, undefined);
   assert.equal(ka.prompt_cache_key, undefined);

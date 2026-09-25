@@ -41,7 +41,7 @@ module.exports = function (pi) {
   const cfg = {
     enabled: envBool(env, "GEMINI_CACHE_GUARD_ENABLED", true),
     intervalMs: envInt(env, "GEMINI_CACHE_GUARD_INTERVAL_MS", 180_000),
-    idleCapMs: envInt(env, "GEMINI_CACHE_GUARD_IDLE_CAP_MS", 1_800_000),
+    idleCapMs: envInt(env, "GEMINI_CACHE_GUARD_IDLE_CAP_MS", 3_600_000),
     minDelayMs: envInt(env, "GEMINI_CACHE_GUARD_MIN_DELAY_MS", 1_000),
     requestTimeoutMs: envInt(env, "GEMINI_CACHE_GUARD_TIMEOUT_MS", 45_000),
     minContextTokens: envInt(env, "GEMINI_CACHE_GUARD_MIN_CONTEXT_TOKENS", 8_192),

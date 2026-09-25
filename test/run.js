@@ -567,6 +567,54 @@ async function testPluginClonesPayloadOnCapture() {
 }
 
 // ---------------------------------------------------------------------------
+// Интеграция 9: интервал выдерживается между последовательными пингами
+// ---------------------------------------------------------------------------
+async function testPluginPacingHonorsInterval() {
+  const logFile = path.join(__dirname, ".test-9.log");
+  try { fs.unlinkSync(logFile); } catch { /* noop */ }
+  const pi = makePiStub();
+  const calls = [];
+  const timestamps = [];
+  const restore = installFetchStub(calls);
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    timestamps.push(Date.now());
+    return prevFetch(url, init);
+  };
+
+  loadPlugin(
+    {
+      GEMINI_CACHE_GUARD_ENABLED: "1",
+      GEMINI_CACHE_GUARD_INTERVAL_MS: "120",
+      GEMINI_CACHE_GUARD_MIN_DELAY_MS: "20",
+      GEMINI_CACHE_GUARD_IDLE_CAP_MS: "3000",
+      GEMINI_CACHE_GUARD_MIN_CONTEXT_TOKENS: "10",
+      GEMINI_CACHE_GUARD_TIMEOUT_MS: "300",
+      GEMINI_CACHE_GUARD_ENDPOINT: "http://stub/v1",
+      GEMINI_CACHE_GUARD_LOG: logFile,
+    },
+    pi,
+  );
+
+  pi.emit("model_select", { type: "model_select", model: GEMINI_MODEL }, { model: GEMINI_MODEL });
+  pi.emit(
+    "before_provider_request",
+    { type: "before_provider_request", payload: bigPayload(4000) },
+    { model: GEMINI_MODEL },
+  );
+
+  // Спим 320ms. При интервале 120ms должно быть ровно 2 пинга (≈120ms, ≈240ms), а не спам!
+  await sleep(320);
+  assert.equal(calls.length, 2, `ожидалось ровно 2 пинга за 320ms при интервале 120ms, получено ${calls.length}`);
+  const gap = timestamps[1] - timestamps[0];
+  assert.ok(gap >= 95, `интервал между пингами должен быть >=95ms, получен gap=${gap}ms`);
+
+  pi.emit("session_shutdown", { type: "session_shutdown" });
+  restore();
+  console.log("plugin honors ping interval pacing: OK");
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 (async () => {
@@ -579,6 +627,7 @@ async function testPluginClonesPayloadOnCapture() {
   await testPluginBacksOffOnRepeatedErrors();
   await testPluginReadsAnthropicUsagePath();
   await testPluginClonesPayloadOnCapture();
+  await testPluginPacingHonorsInterval();
   console.log("\nALL TESTS PASSED");
 })().catch((err) => {
   console.error("\nTEST FAILED:", err);

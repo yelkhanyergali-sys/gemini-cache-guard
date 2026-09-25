@@ -58,6 +58,7 @@ module.exports = function (pi) {
   let modelRegistry = null; // из ExtensionContext — для резолва endpoint/apiKey
   let lastPayload = null; // последний real payload Gemini-запроса
   let lastActivity = 0; // ts последней реальной активности
+  let lastPing = 0; // ts последнего выполненного keep-alive пинга
   let timer = null; // Node setTimeout handle
   let inflight = null; // AbortController активного пинга
   let guardOn = false;
@@ -98,6 +99,7 @@ module.exports = function (pi) {
     guardOn = false;
     lastPayload = null;
     model = null;
+    lastPing = 0;
     stopTimer();
     cancelInflight();
     log(`guard off: ${reason}`);
@@ -112,12 +114,14 @@ module.exports = function (pi) {
       disableGuard(`idle cap reached (${Math.round(sinceLast / 1000)}s without activity)`);
       return;
     }
-    const delay = Math.max(cfg.minDelayMs, lastActivity + cfg.intervalMs - now);
+    const lastEvent = Math.max(lastActivity, lastPing);
+    const delay = Math.max(cfg.minDelayMs, lastEvent + cfg.intervalMs - now);
     timer = setTimeout(runPing, delay);
   }
 
   function markActivity() {
     lastActivity = Date.now();
+    lastPing = 0;
     consecutiveErrors = 0; // реальная активность обнуляет счётчик ошибок
     schedule();
   }
@@ -280,6 +284,7 @@ module.exports = function (pi) {
     } finally {
       clearTimeout(timeout);
       if (inflight === controller) inflight = null;
+      lastPing = Date.now();
       schedule();
     }
   }

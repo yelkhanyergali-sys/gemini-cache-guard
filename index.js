@@ -18,12 +18,22 @@
  *  5) Смена модели/сессии или закрытие pi останавливает всё.
  *
  * В сессию ничего не пишем: никаких сообщений, никаких вызовов
- * pi.sendUserMessage. Единственный след — строка в /tmp/gemini-cache-guard.log
- * (или GEMINI_CACHE_GUARD_LOG).
+ * pi.sendUserMessage. Единственный след — строка в логе сторожа
+ * (~/.pi/agent/gemini-cache-guard.log или GEMINI_CACHE_GUARD_LOG).
  */
 
-const { buildKeepAlivePayload, estimateInputTokens, isEligibleModel } = require("./lib/core.js");
+const { buildKeepAlivePayload, estimateInputTokens, isEligibleModel, parseCachedTokens } = require("./lib/core.js");
 const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+function defaultLogFile() {
+  try {
+    const home = os.homedir && os.homedir();
+    if (home) return path.join(home, ".pi", "agent", "gemini-cache-guard.log");
+  } catch { /* noop */ }
+  return "/tmp/gemini-cache-guard.log";
+}
 
 module.exports = function (pi) {
   const env = process.env;
@@ -37,7 +47,8 @@ module.exports = function (pi) {
     minContextTokens: envInt(env, "GEMINI_CACHE_GUARD_MIN_CONTEXT_TOKENS", 8_192),
     endpoint: env.GEMINI_CACHE_GUARD_ENDPOINT || "",
     apiKey: env.GEMINI_CACHE_GUARD_API_KEY || "",
-    logFile: env.GEMINI_CACHE_GUARD_LOG || "/tmp/gemini-cache-guard.log",
+    logFile: env.GEMINI_CACHE_GUARD_LOG || defaultLogFile(),
+    maxConsecutiveErrors: envInt(env, "GEMINI_CACHE_GUARD_MAX_ERRORS", 3),
   };
 
   if (!cfg.enabled) return;
@@ -50,6 +61,7 @@ module.exports = function (pi) {
   let timer = null; // Node setTimeout handle
   let inflight = null; // AbortController активного пинга
   let guardOn = false;
+  let consecutiveErrors = 0; // подряд идущие неудачные пинги (429/500/сеть)
 
   // ---- утилиты ----
   function log(msg) {
@@ -106,6 +118,7 @@ module.exports = function (pi) {
 
   function markActivity() {
     lastActivity = Date.now();
+    consecutiveErrors = 0; // реальная активность обнуляет счётчик ошибок
     schedule();
   }
 
@@ -116,12 +129,23 @@ module.exports = function (pi) {
       return;
     }
 
+    // Глубокая копия: ядро pi может мутировать payload на месте,
+    // ссылку хранить нельзя — иначе пинг уйдёт с «поплывшими» данными.
+    // buildKeepAlivePayload уже делает JSON-клон внутри, дублируем сериализацию
+    // для гарантии неизменности на момент отправки.
     const keepAlive = buildKeepAlivePayload(lastPayload);
     if (!keepAlive) {
       disableGuard("payload no longer usable");
       return;
     }
-    const est = estimateInputTokens(keepAlive);
+    let frozenPayload = null;
+    try {
+      frozenPayload = JSON.parse(JSON.stringify(keepAlive));
+    } catch {
+      disableGuard("payload not serializable");
+      return;
+    }
+    const est = estimateInputTokens(frozenPayload);
     if (est < cfg.minContextTokens) {
       log(`ping skip: est=${est} tokens < min(${cfg.minContextTokens})`);
       schedule();
@@ -203,13 +227,20 @@ module.exports = function (pi) {
         res = await fetch(url, {
           method: "POST",
           headers,
-          body: JSON.stringify(keepAlive),
+          body: JSON.stringify(frozenPayload),
           signal: controller.signal,
         });
       } catch (err) {
         const aborted = inflight === null || (err && (/abort/i.test(String(err?.message || err))));
         if (aborted) log("ping cancelled (superseded by activity)");
-        else log(`ping fetch error: ${err}`);
+        else {
+          consecutiveErrors += 1;
+          log(`ping fetch error: ${err} (fail ${consecutiveErrors}/${cfg.maxConsecutiveErrors})`);
+          if (consecutiveErrors >= cfg.maxConsecutiveErrors) {
+            disableGuard(`too many consecutive ping errors (${consecutiveErrors}) — backing off`);
+            return;
+          }
+        }
         return;
       }
 
@@ -220,13 +251,30 @@ module.exports = function (pi) {
         try { bodyText = await res.text(); } catch { bodyText = ""; }
         try {
           const parsed = JSON.parse(bodyText);
-          const usage = (parsed && parsed.usage) || {};
-          const details = usage.prompt_tokens_details || {};
-          cached = details.cached_tokens != null ? details.cached_tokens : null;
+          cached = parseCachedTokens(parsed && parsed.usage);
         } catch { /* не JSON — не страшно */ }
       }
+      // Ответы ротатора несут X-Rotator-Account (маскированный ярлык аккаунта):
+      // по нему видно, какой аккаунт прогрел кэш, а какой отдал cached=0.
+      let account = "";
+      try {
+        const h = res && res.headers && typeof res.headers.get === "function"
+          ? res.headers.get("x-rotator-account")
+          : null;
+        if (h) account = ` acct=${h}`;
+      } catch { /* noop */ }
+      if (status >= 429 || status >= 500) {
+        consecutiveErrors += 1;
+        log(`ping ${status} est=${est} ms=${Date.now() - started}${account} (fail ${consecutiveErrors}/${cfg.maxConsecutiveErrors}) body=${bodyText.slice(0, 240)}`);
+        if (consecutiveErrors >= cfg.maxConsecutiveErrors) {
+          disableGuard(`too many consecutive ping errors (${consecutiveErrors}) — backing off`);
+          return;
+        }
+      } else {
+        consecutiveErrors = 0;
+      }
       const statusPart = status >= 400 ? ` body=${bodyText.slice(0, 240)}` : "";
-      log(`ping ${status} est=${est}${cached != null ? ` cached=${cached}` : ""} ms=${Date.now() - started}${statusPart}`);
+      log(`ping ${status} est=${est}${cached != null ? ` cached=${cached}` : ""} ms=${Date.now() - started}${account}${statusPart}`);
     } catch (err) {
       log(`ping error: ${err}`);
     } finally {
@@ -245,7 +293,12 @@ module.exports = function (pi) {
         model = m;
         modelRegistry = (ctx && ctx.modelRegistry) || modelRegistry;
         guardOn = true;
-        lastPayload = event && event.payload;
+        // Глубокая копия на захвате: дальше ядро может мутировать объект.
+        try {
+          lastPayload = event && event.payload ? JSON.parse(JSON.stringify(event.payload)) : null;
+        } catch {
+          lastPayload = event && event.payload;
+        }
         if (nowedOff) {
           log(`armed est=${estimateInputTokens(lastPayload)} model=${m.id}`);
         }

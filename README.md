@@ -101,8 +101,9 @@ git clone https://github.com/yelkhanyergali-sys/gemini-cache-guard.git ~/.pi/age
 | `GEMINI_CACHE_GUARD_MIN_CONTEXT_TOKENS` | `8192` | Минимальный размер контекста, при котором имеет смысл греть кэш TPU. |
 | `GEMINI_CACHE_GUARD_ENDPOINT` | *(авто)* | Принудительный URL эндпоинта (например, `http://127.0.0.1:51200/v1`). |
 | `GEMINI_CACHE_GUARD_API_KEY` | *(авто)* | Принудительный API-ключ шлюза (если не задан, резолвится автоматически). |
-| `GEMINI_CACHE_GUARD_LOG` | `/tmp/gemini-cache-guard.log` | Путь к файлу логов работы сторожа. |
 | `GEMINI_CACHE_GUARD_MIN_DELAY_MS` | `1000` (1 сек) | Минимальная задержка перед пингом (защита от дребезга). |
+| `GEMINI_CACHE_GUARD_LOG` | `~/.pi/agent/gemini-cache-guard.log` | Путь к файлу логов работы сторожа. |
+| `GEMINI_CACHE_GUARD_MAX_ERRORS` | `3` | Подряд идущих ошибок пинга (429/500/сеть), после которых сторож гаснет (backoff). Реальная активность обнуляет счётчик. |
 
 ### Автоматический каскад поиска эндпоинта
 Если `GEMINI_CACHE_GUARD_ENDPOINT` не задан вручную, плагин разрешает адрес по надёжной цепочке:
@@ -130,10 +131,10 @@ git clone https://github.com/yelkhanyergali-sys/gemini-cache-guard.git ~/.pi/age
 
 ## Мониторинг и логирование
 
-Плагин ведёт чистый лог в `/tmp/gemini-cache-guard.log`. Вы можете следить за его работой в реальном времени:
+Плагин ведёт чистый лог в `~/.pi/agent/gemini-cache-guard.log`. Вы можете следить за его работой в реальном времени:
 
 ```bash
-tail -f /tmp/gemini-cache-guard.log
+tail -f ~/.pi/agent/gemini-cache-guard.log
 ```
 
 ### Примеры записей:

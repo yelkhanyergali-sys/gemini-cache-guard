@@ -85,6 +85,20 @@ function testCore() {
   assert.equal(CORE.estimateInputTokens(null), 0);
   assert.equal(CORE.estimateInputTokens({ messages: undefined }), 0);
 
+  // estimateInputTokens: кириллица считается почти посимвольно (≈1.2 симв/токен)
+  const cyr = { messages: [{ role: "user", content: "ф".repeat(1200) }] };
+  const cyrEst = CORE.estimateInputTokens(cyr);
+  assert.ok(cyrEst >= 800, `кириллица не должна занижаться: est=${cyrEst}`);
+  assert.ok(cyrEst > CORE.estimateInputTokens({ messages: [{ role: "user", content: "x".repeat(1200) }] }),
+    "кириллица должна оцениваться выше латиницы той же длины");
+
+  // parseCachedTokens: оба пути ротатора + плоский вариант
+  assert.equal(CORE.parseCachedTokens({ prompt_tokens_details: { cached_tokens: 5 } }), 5);
+  assert.equal(CORE.parseCachedTokens({ input_tokens_details: { cached_tokens: 7 } }), 7);
+  assert.equal(CORE.parseCachedTokens({ cached_tokens: 9 }), 9);
+  assert.equal(CORE.parseCachedTokens({}), null);
+  assert.equal(CORE.parseCachedTokens(null), null);
+
   console.log("core.js: OK");
 }
 
@@ -147,16 +161,24 @@ function bigPayload(n) {
   };
 }
 
-function installFetchStub(calls) {
+function installFetchStub(calls, opts) {
+  opts = opts || {};
   const prev = globalThis.fetch;
+  const usage = opts.usage !== undefined ? opts.usage
+    : { prompt_tokens_details: { cached_tokens: 100_000 } };
+  let status = opts.status !== undefined ? opts.status : 200;
+  let statusSeq = Array.isArray(opts.statusSeq) ? opts.statusSeq.slice() : null;
+  const headers = opts.headers || null;
   globalThis.fetch = async (url, init) => {
     calls.push({ url, init });
+    const st = statusSeq && statusSeq.length ? statusSeq.shift() : status;
+    const hdr = {};
+    if (headers) Object.assign(hdr, headers);
+    if (opts.accountHeader) hdr["x-rotator-account"] = opts.accountHeader;
     return {
-      status: 200,
-      text: async () =>
-        JSON.stringify({
-          usage: { prompt_tokens_details: { cached_tokens: 100_000 } },
-        }),
+      status: st,
+      headers: { get: (name) => hdr[String(name).toLowerCase()] ?? null },
+      text: async () => (st >= 500 && opts.errorBody !== undefined ? opts.errorBody : JSON.stringify({ usage })),
     };
   };
   return () => {
@@ -401,6 +423,150 @@ async function testPluginResolvesEndpointFromRegistry() {
 }
 
 // ---------------------------------------------------------------------------
+// Интеграция 6: три подряд 429 → сторож гаснет (backoff), лог содержит причину
+// ---------------------------------------------------------------------------
+async function testPluginBacksOffOnRepeatedErrors() {
+  const logFile = path.join(__dirname, ".test-6.log");
+  try { fs.unlinkSync(logFile); } catch { /* noop */ }
+  const pi = makePiStub();
+  const calls = [];
+  const restore = installFetchStub(calls, { status: 429, errorBody: '{"error":{"message":"Rate limit"}}' });
+
+  loadPlugin(
+    {
+      GEMINI_CACHE_GUARD_ENABLED: "1",
+      GEMINI_CACHE_GUARD_INTERVAL_MS: "100",
+      GEMINI_CACHE_GUARD_MIN_DELAY_MS: "20",
+      GEMINI_CACHE_GUARD_IDLE_CAP_MS: "5000",
+      GEMINI_CACHE_GUARD_MIN_CONTEXT_TOKENS: "10",
+      GEMINI_CACHE_GUARD_TIMEOUT_MS: "300",
+      GEMINI_CACHE_GUARD_MAX_ERRORS: "3",
+      GEMINI_CACHE_GUARD_ENDPOINT: "http://stub/v1",
+      GEMINI_CACHE_GUARD_LOG: logFile,
+    },
+    pi,
+  );
+
+  pi.emit("model_select", { type: "model_select", model: GEMINI_MODEL }, { model: GEMINI_MODEL });
+  pi.emit(
+    "before_provider_request",
+    { type: "before_provider_request", payload: bigPayload(4000) },
+    { model: GEMINI_MODEL },
+  );
+
+  await sleep(1200);
+  const countAtBackoff = calls.length;
+  assert.ok(countAtBackoff >= 3 && countAtBackoff <= 4,
+    `ожидалось ~3 пинга до backoff, получено ${countAtBackoff}`);
+  await sleep(500);
+  assert.equal(calls.length, countAtBackoff, "после backoff пинги должны остановиться");
+  const log = fs.readFileSync(logFile, "utf-8");
+  assert.match(log, /too many consecutive ping errors/, "лог должен содержать причину backoff");
+
+  // Реальная активность снимает backoff: новый запрос снова взводит сторож.
+  // Итог: disableGuard очистил lastPayload, поэтому нужен свежий запрос.
+  pi.emit(
+    "before_provider_request",
+    { type: "before_provider_request", payload: bigPayload(4000) },
+    { model: GEMINI_MODEL },
+  );
+  await sleep(400);
+  assert.ok(calls.length > countAtBackoff, "после новой активности пинги возобновляются");
+
+  pi.emit("session_shutdown", { type: "session_shutdown" });
+  restore();
+  console.log("plugin backs off on repeated 429: OK");
+}
+
+// ---------------------------------------------------------------------------
+// Интеграция 7: Anthropic-путь usage (input_tokens_details) тоже читается
+// ---------------------------------------------------------------------------
+async function testPluginReadsAnthropicUsagePath() {
+  const logFile = path.join(__dirname, ".test-7.log");
+  try { fs.unlinkSync(logFile); } catch { /* noop */ }
+  const pi = makePiStub();
+  const calls = [];
+  const restore = installFetchStub(calls, {
+    usage: { input_tokens_details: { cached_tokens: 4242 } },
+    accountHeader: null,
+  });
+
+  loadPlugin(
+    {
+      GEMINI_CACHE_GUARD_ENABLED: "1",
+      GEMINI_CACHE_GUARD_INTERVAL_MS: "120",
+      GEMINI_CACHE_GUARD_MIN_DELAY_MS: "30",
+      GEMINI_CACHE_GUARD_IDLE_CAP_MS: "3000",
+      GEMINI_CACHE_GUARD_MIN_CONTEXT_TOKENS: "10",
+      GEMINI_CACHE_GUARD_TIMEOUT_MS: "300",
+      GEMINI_CACHE_GUARD_ENDPOINT: "http://stub/v1",
+      GEMINI_CACHE_GUARD_LOG: logFile,
+    },
+    pi,
+  );
+
+  pi.emit("model_select", { type: "model_select", model: GEMINI_MODEL }, { model: GEMINI_MODEL });
+  pi.emit(
+    "before_provider_request",
+    { type: "before_provider_request", payload: bigPayload(4000) },
+    { model: GEMINI_MODEL },
+  );
+
+  await sleep(500);
+  assert.ok(calls.length >= 1, "пинг должен уйти");
+  const log = fs.readFileSync(logFile, "utf-8");
+  assert.match(log, /cached=4242/, "лог должен содержать cached=4242 из input_tokens_details");
+  pi.emit("session_shutdown", { type: "session_shutdown" });
+  restore();
+  console.log("plugin reads anthropic usage path: OK");
+}
+
+// ---------------------------------------------------------------------------
+// Интеграция 8: payload клонируется на захвате (мутация ядра не портит пинг)
+// ---------------------------------------------------------------------------
+async function testPluginClonesPayloadOnCapture() {
+  const logFile = path.join(__dirname, ".test-8.log");
+  try { fs.unlinkSync(logFile); } catch { /* noop */ }
+  const pi = makePiStub();
+  const calls = [];
+  const restore = installFetchStub(calls);
+
+  loadPlugin(
+    {
+      GEMINI_CACHE_GUARD_ENABLED: "1",
+      GEMINI_CACHE_GUARD_INTERVAL_MS: "120",
+      GEMINI_CACHE_GUARD_MIN_DELAY_MS: "30",
+      GEMINI_CACHE_GUARD_IDLE_CAP_MS: "3000",
+      GEMINI_CACHE_GUARD_MIN_CONTEXT_TOKENS: "10",
+      GEMINI_CACHE_GUARD_TIMEOUT_MS: "300",
+      GEMINI_CACHE_GUARD_ENDPOINT: "http://stub/v1",
+      GEMINI_CACHE_GUARD_LOG: logFile,
+    },
+    pi,
+  );
+
+  pi.emit("model_select", { type: "model_select", model: GEMINI_MODEL }, { model: GEMINI_MODEL });
+  const original = bigPayload(4000);
+  pi.emit(
+    "before_provider_request",
+    { type: "before_provider_request", payload: original },
+    { model: GEMINI_MODEL },
+  );
+  // Ядро мутирует payload на месте ПОСЛЕ захвата сторожем.
+  original.messages[0].content = "MUTATED";
+  original.messages.push({ role: "user", content: "INJECTED" });
+
+  await sleep(500);
+  assert.ok(calls.length >= 1, "пинг должен уйти");
+  const body = JSON.parse(calls[0].init.body);
+  assert.ok(!JSON.stringify(body).includes("MUTATED"), "пинг не должен содержать мутацию");
+  assert.ok(!JSON.stringify(body).includes("INJECTED"), "пинг не должен содержать инъекцию");
+  pi.emit("session_shutdown", { type: "session_shutdown" });
+  restore();
+  console.log("plugin clones payload on capture: OK");
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 (async () => {
@@ -410,6 +576,9 @@ async function testPluginResolvesEndpointFromRegistry() {
   await testPluginIdleCap();
   await testPluginSmallCtxAndSessionStop();
   await testPluginResolvesEndpointFromRegistry();
+  await testPluginBacksOffOnRepeatedErrors();
+  await testPluginReadsAnthropicUsagePath();
+  await testPluginClonesPayloadOnCapture();
   console.log("\nALL TESTS PASSED");
 })().catch((err) => {
   console.error("\nTEST FAILED:", err);

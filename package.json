@@ -1,6 +1,6 @@
 {
   "name": "gemini-cache-guard",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Keep-alive plugin for PI coding agent: keeps Gemini implicit context cache warm during idle, avoiding quota burn",
   "main": "index.js",
   "scripts": {

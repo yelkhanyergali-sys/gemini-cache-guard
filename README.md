@@ -1,5 +1,9 @@
 # gemini-cache-guard
 
+[![Tests](https://img.shields.io/badge/tests-10%2F10%20passing-brightgreen)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Version: 1.1.0](https://img.shields.io/badge/version-1.1.0-blue)]()
+
 Фоновый keep-alive сторож для языковых моделей Google Gemini, подключённых к PI Coding Agent через OpenAI-совместимый шлюз или ротатор (`agy` → Tuxevil / LiteLLM / Cloud Code).
 
 Автоматически держит неявный контекстный кэш (Implicit TPU Cache) горячим в периоды простоя пользователя с **нулевым расходом токенов генерации** (Zero Quota Burn).
@@ -68,7 +72,7 @@ git clone https://github.com/yelkhanyergali-sys/gemini-cache-guard.git ~/.pi/age
 ```json
 {
   "extensions": [
-    "/home/admin/.pi/agent/extensions/gemini-cache-guard"
+    "~/.pi/agent/extensions/gemini-cache-guard"
   ]
 }
 ```
